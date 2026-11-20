@@ -57,6 +57,8 @@ python3 -m venv .venv
 | POST | `/api/match` | 在指定版本上匹配,返回匹配路段、进入/离开时刻、里程、缺口 |
 | GET | `/api/analyses` | 查询历史分析(可按 `network_version`、`trajectory_id` 过滤) |
 | GET | `/api/analyses/{id}` | 查看分析结果 |
+| POST | `/api/clip` | 按分析的**路网版本**填写路段里程范围裁剪行程(见下) |
+| POST | `/api/analyses/{id}/clip` | 同上,分析编号放在路径中 |
 | GET | `/health` | 健康检查 |
 
 ### 示例
@@ -109,17 +111,95 @@ curl -X POST localhost:8000/api/match -H 'Content-Type: application/json' \
 }
 ```
 
-## 项目结构
+## 轨迹裁剪
 
+养护单位向承包方交付巡检数据时,往往只提供合同范围内的行程。裁剪 API 以一次**已有分析**为基础,
+按该分析所用路网版本的有向路段编号与里程范围,从原行程中截取范围内的部分。
+
+```bash
+# 裁剪分析 1:S1 的 20–60 米 + S2 的 0–80 米(S1 的范围可重复填写,自动取并集)
+curl -X POST localhost:8000/api/clip -H 'Content-Type: application/json' -d '{
+  "analysis_id": 1,
+  "ranges": [
+    {"segment_id": "S1", "start_m": 20, "end_m": 60},
+    {"segment_id": "S2", "start_m": 0,  "end_m": 80}
+  ]
+}'
 ```
+
+```json
+{
+  "analysis_id": 1,
+  "trajectory_id": 1,
+  "network_version": "v1",
+  "piece_count": 2,
+  "distance_m": 120.0,
+  "pieces": [
+    {"seq": 0, "enter_time": "2026-01-01T08:00:04.705Z",
+     "leave_time": "2026-01-01T08:00:14.117Z", "distance_m": 40.0,
+     "segments": [
+       {"segment_id": "S1", "start_m": 20.0, "end_m": 60.0,
+        "from_m": 20.0, "to_m": 60.0, "distance_m": 40.0,
+        "enter_time": "2026-01-01T08:00:04.705Z",
+        "leave_time": "2026-01-01T08:00:14.117Z"}
+     ]},
+    {"seq": 1, "enter_time": "2026-01-01T08:00:20.000Z",
+     "leave_time": "2026-01-01T08:00:34.414Z", "distance_m": 80.0,
+     "segments": [
+       {"segment_id": "S2", "start_m": 0.0, "end_m": 80.0,
+        "from_m": 0.0, "to_m": 80.0, "distance_m": 80.0,
+        "enter_time": "2026-01-01T08:00:20.000Z",
+        "leave_time": "2026-01-01T08:00:34.414Z"}
+     ]}
+  ],
+  "segments": [
+    {"piece": 0, "seq": 0, "segment_id": "S1", "start_m": 20.0, "end_m": 60.0,
+     "distance_m": 40.0, "enter_time": "2026-01-01T08:00:04.705Z",
+     "leave_time": "2026-01-01T08:00:14.117Z"},
+    {"piece": 1, "seq": 1, "segment_id": "S2", "start_m": 0.0, "end_m": 80.0,
+     "distance_m": 80.0, "enter_time": "2026-01-01T08:00:20.000Z",
+     "leave_time": "2026-01-01T08:00:34.414Z"}
+  ]
+}
+```
+
+上例中 S1 只取到 60 米即驶出范围,故 S1 的后半段与 S2 分成两个片段。
+
+规则:
+
+- **范围**按分析所用路网版本填写:有向路段编号 + 距**路段起点**的起止里程(米),
+  起止里程须递增且落在 `[0, 路段长度]` 内;路段不存在、里程非法或越界时**整次请求被拒绝**
+  (422),不会产出部分裁剪结果。
+- **同一路段的多个范围取并集**(重叠或相接的区间合并);不同路段的范围各自独立。
+- **连续片段**:结果按原行程顺序给出;同一片段内的路段首尾相接,片段之间因
+  **驶出范围**或**原有缺口**而断开。`pieces` 为分组视图,`segments` 为同一内容的扁平视图。
+- **时刻**:裁剪端点的进入/离开时刻,按原分析中相邻采样点之间的**行驶里程比例插值**,
+  与原分析的时间口径一致。
+- **静止记录**不单独成段;若车辆在范围内停留,停留时间计入所在片段的离开时刻。
+- **无交集**时返回空列表(`piece_count: 0`)——这是正常结果,不是错误。
+- 请求体也可直接提交范围列表,此时分析编号通过路径或 `?analysis_id=` 给出;
+  `start_m`/`end_m` 亦可写作 `from_m`/`to_m`。
+
+### 裁剪明细与持久化
+
+- 匹配时除路径与缺口外,还会把**裁剪所需明细**(未按路段合并的细粒度片段:路段编号、
+  起止里程、进出时刻,以及标识连续运行段的 `run_seq`)与分析写在**同一事务**内落库
+  (`analysis_details` 表)。明细写入失败则整次分析都不生成,便于整体重试。
+- 明细随分析持久化,服务重启后**可直接裁剪,无需重做匹配**。
+- **旧分析**(本功能上线前生成、没有明细)仍可按原接口 `GET /api/analyses/{id}` 查询;
+  对其申请裁剪会返回 **409**,提示重新分析。旧库在启动时自动补列建表,无需手工迁移。
+
+## 项目结构```
 app/
   main.py      FastAPI 路由与持久化
-  matcher.py   HMM + Viterbi 匹配引擎(候选、有向图最短路、缺口检测)
+  matcher.py   HMM + Viterbi 匹配引擎(候选、有向图最短路、缺口检测、裁剪明细)
+  clip.py      轨迹裁剪(范围并集、里程插值、驶出范围/缺口断开)
   geo.py       球面距离、点到线段投影
   db.py        SQLite 连接与建表
   schemas.py   请求校验(Pydantic)
   util.py      UTC 时间处理
-tests/test_api.py  端到端测试(连续路径、两类缺口、多候选全局最优、版本隔离)
+tests/test_api.py   端到端测试(连续路径、两类缺口、多候选全局最优、版本隔离)
+tests/test_clip.py  裁剪测试(范围校验、并集、插值、静止记录、缺口/驶出断开、持久化、旧分析)
 Dockerfile / docker-compose.yml
 ```
 

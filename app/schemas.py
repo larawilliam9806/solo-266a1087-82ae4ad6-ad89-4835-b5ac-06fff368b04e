@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import AliasChoices, BaseModel, Field, field_validator
 
 
 class SegmentIn(BaseModel):
@@ -49,3 +49,20 @@ class TrajectoryCreate(BaseModel):
 class MatchRequest(BaseModel):
     trajectory_id: int
     network_version: str = Field(min_length=1, description="指定匹配使用的路网版本;一次分析只使用该版本快照")
+
+
+class ClipRange(BaseModel):
+    """按分析所用路网版本填写的路段里程范围(从路段起点计,单位米)。"""
+    segment_id: str = Field(min_length=1, max_length=128, description="有向路段编号")
+    start_m: float = Field(
+        ge=0, description="范围起点里程(距路段起点,米)",
+        validation_alias=AliasChoices("start_m", "from_m", "start_offset_m", "from_offset_m"))
+    end_m: float = Field(
+        ge=0, description="范围终点里程(距路段起点,米)",
+        validation_alias=AliasChoices("end_m", "to_m", "end_offset_m", "to_offset_m"))
+
+
+class ClipRequest(BaseModel):
+    analysis_id: int | None = Field(default=None, description="要裁剪的分析编号(走路径/查询参数时可省略)")
+    ranges: list[ClipRange] = Field(min_length=1, description="按分析路网版本填写的路段里程范围",
+                                    validation_alias=AliasChoices("ranges", "segments"))

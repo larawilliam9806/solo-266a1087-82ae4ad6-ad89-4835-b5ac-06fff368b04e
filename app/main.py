@@ -9,16 +9,18 @@
   POST /api/match             在指定路网版本上执行匹配,生成连续路径与缺口
   GET  /api/analyses          按路网版本 / 轨迹查询历史分析
   GET  /            /api/analyses/{id} 查看分析结果(匹配路段、进入/离开时刻、里程、缺口原因)
+  POST /api/clip              按分析路网版本的路段里程范围裁剪行程,返回连续片段
 """
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Body, FastAPI, HTTPException, Query
 
 from . import db
+from .clip import clip_analysis, merge_intervals
 from .matcher import NetworkIndex, Segment, TrackPoint
-from .schemas import MatchRequest, NetworkCreate, TrajectoryCreate
+from .schemas import ClipRange, ClipRequest, MatchRequest, NetworkCreate, TrajectoryCreate
 from .util import fmt_ts, parse_ts, utcnow
 
 
@@ -186,7 +188,7 @@ def run_match(body: MatchRequest):
     try:
         cur = conn.execute(
             "INSERT INTO analyses (trajectory_id, network_id, created_at, total_points, "
-            "matched_points, total_distance_m) VALUES (?, ?, ?, ?, ?, ?)",
+            "matched_points, total_distance_m, has_detail) VALUES (?, ?, ?, ?, ?, ?, 1)",
             (traj["id"], net["id"], now, result["total_points"],
              result["matched_points"], result["total_distance_m"]),
         )
@@ -203,7 +205,18 @@ def run_match(body: MatchRequest):
             [(aid, g["seq"], g["start_time"], g["end_time"], g["reason"])
              for g in result["gaps"]],
         )
+        # 裁剪所需明细与分析在同一事务内落库:保存失败则整次分析都不生成
+        conn.executemany(
+            "INSERT INTO analysis_details (analysis_id, seq, run_seq, segment_id, "
+            "enter_time, leave_time, from_m, to_m) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            [(aid, k, d["run_seq"], d["segment_id"], d["enter_time"], d["leave_time"],
+              d["from_m"], d["to_m"])
+             for k, d in enumerate(result["detail"])],
+        )
         conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 
@@ -262,6 +275,140 @@ def get_analysis(analysis_id: int):
                 "gaps": [dict(g) for g in gaps]}
     finally:
         conn.close()
+
+
+# ------------------------------------------------------------------ 轨迹裁剪
+def _ranges_from_body(body) -> list[ClipRange]:
+    """请求体既可以是 ``{"analysis_id", "ranges"}``,也可以是直接的范围列表。"""
+    if isinstance(body, list):
+        return body
+    return body.ranges
+
+
+def _check_ranges(ranges: list[ClipRange], lengths: dict[str, float],
+                  analysis_id: int, version: str) -> dict[str, list[list[float]]]:
+    """校验范围并返回按路段分组的区间(尚未合并)。
+
+    任一路段不存在、起止里程不递增或超出路段长度,整次请求拒绝,不做部分裁剪。
+    """
+    if not ranges:
+        raise HTTPException(422, "至少需要一个路段里程范围")
+    by_segment: dict[str, list[tuple[float, float]]] = {}
+    for r in ranges:
+        if r.segment_id not in lengths:
+            raise HTTPException(
+                422, f"路段 '{r.segment_id}' 不存在于分析 {analysis_id} 所用的路网版本 '{version}'")
+        if not r.end_m > r.start_m:
+            raise HTTPException(
+                422, f"路段 '{r.segment_id}' 的范围非法:end_m({r.end_m}) 必须大于 start_m({r.start_m})")
+        if r.end_m > lengths[r.segment_id] + 1e-6:
+            raise HTTPException(
+                422, f"路段 '{r.segment_id}' 的范围 [{r.start_m}, {r.end_m}] "
+                     f"超出路段长度 {lengths[r.segment_id]}m")
+        by_segment.setdefault(r.segment_id, []).append((r.start_m, r.end_m))
+    return {sid: merge_intervals(rs) for sid, rs in by_segment.items()}
+
+
+def _run_clip(analysis_id: int, ranges: list[ClipRange]) -> dict:
+    conn = db.connect()
+    try:
+        a = conn.execute(
+            "SELECT a.id, a.has_detail, a.trajectory_id, n.version AS network_version "
+            "FROM analyses a JOIN networks n ON n.id = a.network_id WHERE a.id = ?",
+            (analysis_id,)
+        ).fetchone()
+        if not a:
+            raise HTTPException(404, f"分析 {analysis_id} 不存在")
+        if not a["has_detail"]:
+            raise HTTPException(
+                409, f"分析 {analysis_id} 缺少裁剪所需明细(可能由旧版本生成),请重新分析后再申请裁剪")
+        seg_rows = conn.execute(
+            "SELECT s.segment_id, s.length_m FROM segments s "
+            "JOIN analyses a ON a.network_id = s.network_id WHERE a.id = ?", (a["id"],)
+        ).fetchall()
+        lengths = {r["segment_id"]: r["length_m"] for r in seg_rows}
+        merged = _check_ranges(ranges, lengths, a["id"], a["network_version"])
+        detail_rows = conn.execute(
+            "SELECT seq, run_seq, segment_id, enter_time, leave_time, from_m, to_m "
+            "FROM analysis_details WHERE analysis_id = ? ORDER BY seq", (a["id"],)
+        ).fetchall()
+    finally:
+        conn.close()
+
+    pieces = clip_analysis([dict(r) for r in detail_rows], merged)
+
+    out_pieces: list[dict] = []
+    flat_segments: list[dict] = []
+    for p in pieces:
+        segments = []
+        for s in p["segments"]:
+            item = {
+                "segment_id": s["segment_id"],
+                # 裁剪后的里程(距路段起点,米);from_m/to_m 为同义别名
+                "start_m": round(s["start_m"], 3),
+                "end_m": round(s["end_m"], 3),
+                "from_m": round(s["start_m"], 3),
+                "to_m": round(s["end_m"], 3),
+                "distance_m": round(s["end_m"] - s["start_m"], 3),
+                "enter_time": fmt_ts(s["enter_time"]),
+                "leave_time": fmt_ts(s["leave_time"]),
+            }
+            segments.append(item)
+            flat_segments.append({"piece": p["seq"], "seq": len(flat_segments),
+                                  **{k: v for k, v in item.items() if k not in ("from_m", "to_m")}})
+        out_pieces.append({
+            "seq": p["seq"],
+            "enter_time": segments[0]["enter_time"],
+            "leave_time": segments[-1]["leave_time"],
+            "distance_m": round(sum(s["distance_m"] for s in segments), 3),
+            "segments": segments,
+        })
+
+    return {"analysis_id": a["id"], "trajectory_id": a["trajectory_id"],
+            "network_version": a["network_version"],
+            "piece_count": len(out_pieces),
+            "distance_m": round(sum(p["distance_m"] for p in out_pieces), 3),
+            # 连续片段:同一片段内路段首尾相接;片段之间因驶出范围或原有缺口而断开
+            "pieces": out_pieces,
+            # 同一内容的扁平视图:按原行程顺序逐路段列出裁剪后的里程与时刻
+            "segments": flat_segments}
+
+
+@app.post("/api/clip")
+def clip(body: ClipRequest | list[ClipRange] = Body(...),
+         analysis_id: int | None = Query(default=None, description="分析编号(请求体已含时可省略)")):
+    """按分析路网版本的路段里程范围裁剪行程(分析编号也可放在路径中)。
+
+    请求体为 ``{"analysis_id": ..., "ranges": [
+    {"segment_id": "...", "start_m": ..., "end_m": ...}, ...]}``;也可直接提交范围列表,
+    此时分析编号可通过查询参数 ``?analysis_id=`` 指定。``start_m`` / ``end_m``
+    (别名 ``from_m`` / ``to_m``)为距路段起点的里程,单位米。
+
+    - 路段必须存在于该分析所用的路网版本;起止里程须递增且落在路段长度内,
+      任一范围非法则整次请求被拒绝,不做部分裁剪。
+    - 同一路段的多个范围取并集;驶出范围或遇到原分析中的缺口即断开为多个片段。
+    - 按原行程顺序返回连续片段,逐路段给出裁剪后的起止里程与进出 UTC 时刻;
+      裁剪端点时刻按原分析中相邻采样点间的行驶里程插值;静止记录不单独成段。
+    - 无交集时返回空列表;旧分析缺少明细时返回 409,提示重新分析。
+    """
+    if isinstance(body, ClipRequest):
+        if analysis_id is not None and body.analysis_id not in (None, analysis_id):
+            raise HTTPException(422, "请求体中的 analysis_id 与查询参数不一致")
+        aid = body.analysis_id if body.analysis_id is not None else analysis_id
+    else:
+        aid = analysis_id
+    if aid is None:
+        raise HTTPException(422, "缺少 analysis_id:请在请求体中提供,或通过查询参数 ?analysis_id= 指定")
+    return _run_clip(aid, _ranges_from_body(body))
+
+
+@app.post("/api/analyses/{analysis_id}/clip")
+def clip_analysis_endpoint(analysis_id: int,
+                           body: ClipRequest | list[ClipRange] = Body(...)):
+    """同 ``POST /api/clip``,分析编号取自路径。"""
+    if isinstance(body, ClipRequest) and body.analysis_id not in (None, analysis_id):
+        raise HTTPException(422, "路径中的 analysis_id 与请求体不一致")
+    return _run_clip(analysis_id, _ranges_from_body(body))
 
 
 @app.get("/health")

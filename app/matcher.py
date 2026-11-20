@@ -205,13 +205,20 @@ class NetworkIndex:
 
     # --------------------------------------------------------------- 结果组装
     def _build_visits(self, points, idxs, path, cands):
-        """把一段匹配结果展开为连续路段序列,并按里程比例插值进入/离开时刻。"""
+        """把一段匹配结果展开为连续路段序列,并按里程比例插值进入/离开时刻。
+
+        返回 ``(merged, raw)``:
+          - merged: 相邻同路段合并后的路径段,供分析结果展示;
+          - raw:    未合并的细粒度片段(含起止里程),随分析一起落库,供裁剪使用。
+                    每个片段为 ``(seg_idx, enter_time, leave_time, distance_m,
+                    from_m, to_m)``,from/to 为距路段起点的里程。
+        """
         pts = [points[i] for i in idxs]
         chosen = [cands[i][p] for i, p in zip(idxs, path)]
-        raw: list[tuple[int, datetime, datetime, float]] = []
+        raw: list[tuple[int, datetime, datetime, float, float, float]] = []
         if len(chosen) == 1:
             c = chosen[0]
-            raw.append((c.seg_idx, pts[0].ts, pts[0].ts, 0.0))
+            raw.append((c.seg_idx, pts[0].ts, pts[0].ts, 0.0, c.offset_m, c.offset_m))
         for k in range(len(chosen) - 1):
             a, b = chosen[k], chosen[k + 1]
             route = self.connector(a, b)
@@ -226,22 +233,25 @@ class NetworkIndex:
             for (si, frm, to), dd in zip(parts, dists):
                 frac = (acc + dd) / total if total > 0 else 0.0
                 tn = t0 + timedelta(seconds=span * frac)
-                raw.append((si, tcur, tn, dd))
+                raw.append((si, tcur, tn, dd, frm, to))
                 tcur, acc = tn, acc + dd
         # 丢弃零长度片段(整段都为零时保留一条),再合并相邻同路段
         nonzero = [r for r in raw if r[3] > 1e-6]
         if nonzero:
-            raw = nonzero
+            to_merge = nonzero
         elif not raw:
-            return []
+            return [], []
+        else:
+            to_merge = raw
         merged: list[list] = []
-        for si, te, tl, dd in raw:
+        for si, te, tl, dd, frm, to in to_merge:
             if merged and merged[-1][0] == si:
                 merged[-1][2] = tl
                 merged[-1][3] += dd
+                merged[-1][5] = to
             else:
-                merged.append([si, te, tl, dd])
-        return [tuple(m) for m in merged]
+                merged.append([si, te, tl, dd, frm, to])
+        return [tuple(m) for m in merged], raw
 
     def match(self, points: list[TrackPoint]) -> dict:
         """对按时间升序的轨迹点列执行匹配,返回路径、缺口与统计。"""
@@ -263,12 +273,22 @@ class NetworkIndex:
 
         # 2) 展开为连续路径
         visits: list[tuple] = []
+        detail: list[dict] = []
         ranges: list[tuple[int, int]] = []
-        for idxs, path in pieces:
-            v = self._build_visits(points, idxs, path, cands)
+        for run_seq, (idxs, path) in enumerate(pieces):
+            v, raw = self._build_visits(points, idxs, path, cands)
             if v:
                 visits.extend(v)
                 ranges.append((idxs[0], idxs[-1]))
+                for si, te, tl, dd, frm, to in raw:
+                    detail.append({
+                        "run_seq": run_seq,
+                        "segment_id": self.segments[si].segment_id,
+                        "enter_time": fmt_ts(te),
+                        "leave_time": fmt_ts(tl),
+                        "from_m": round(frm, 3),
+                        "to_m": round(to, 3),
+                    })
 
         # 3) 缺口
         gaps: list[dict] = []
@@ -297,7 +317,7 @@ class NetworkIndex:
              "enter_time": fmt_ts(te),
              "leave_time": fmt_ts(tl),
              "distance_m": round(dd, 3)}
-            for k, (si, te, tl, dd) in enumerate(visits)
+            for k, (si, te, tl, dd, _frm, _to) in enumerate(visits)
         ]
         for k, g in enumerate(gaps):
             g["seq"] = k
@@ -308,4 +328,5 @@ class NetworkIndex:
             "total_distance_m": round(sum(v[3] for v in visits), 3),
             "path": path_json,
             "gaps": gaps,
+            "detail": detail,
         }
