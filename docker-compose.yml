@@ -1,0 +1,15 @@
+services:
+  api:
+    build: .
+    image: traj-matcher:latest
+    container_name: traj-matcher
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_PATH: /data/app.db
+    volumes:
+      - traj-data:/data
+    restart: unless-stopped
+
+volumes:
+  traj-data:
